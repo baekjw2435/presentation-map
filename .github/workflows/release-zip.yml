@@ -1,0 +1,79 @@
+name: release-zip
+
+# Builds the ZIP of the bundle (the files listed in SHA256SUMS.txt) and, when started by hand with upload = yes,
+# attaches it and SHA256SUMS.txt to the GitHub release <tag>, then downloads both again and compares SHA-256.
+# The ZIP must have the SHA-256 given in expect_sha256 (the one built in the research repository), or nothing is uploaded.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag; the ZIP is named <tag>.zip"
+        default: "presentation-map-2026-11-14"
+      expect_sha256:
+        description: "SHA-256 the ZIP must have"
+        default: "6a55e802ec570c8fa8454a39e1f853c820afd11722f5841a229cb076ee964710"
+      upload:
+        description: "yes = create the release and attach the files; anything else = only build and check"
+        default: "no"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-zip
+  cancel-in-progress: false
+
+jobs:
+  zip:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      EXPECT: ${{ inputs.expect_sha256 }}
+      UPLOAD: ${{ inputs.upload }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Check the files and build the ZIP
+        run: |
+          set -euo pipefail
+          case "$TAG" in presentation-map-*) ;; *) echo "unexpected tag: $TAG"; exit 1 ;; esac
+          mkdir -p "$RUNNER_TEMP/out"
+          python3 -c "import zlib, sys; print('python', sys.version.split()[0], 'zlib', zlib.ZLIB_RUNTIME_VERSION)"
+          python3 .github/zip_bundle.py . "$RUNNER_TEMP/out/$TAG.zip" | tee "$RUNNER_TEMP/zip.json"
+          cp SHA256SUMS.txt "$RUNNER_TEMP/out/SHA256SUMS.txt"
+          got=$(sha256sum "$RUNNER_TEMP/out/$TAG.zip" | cut -d' ' -f1)
+          echo "- ZIP $TAG.zip: $(stat -c %s "$RUNNER_TEMP/out/$TAG.zip") bytes, SHA-256 $got (expected $EXPECT)" >> "$GITHUB_STEP_SUMMARY"
+          [ "$got" = "$EXPECT" ] || { echo "ZIP SHA-256 differs from expect_sha256"; exit 1; }
+      - name: Create the release and attach the files
+        if: inputs.upload == 'yes'
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            {
+              echo "제시 단어 수순 지도의 이식용 묶음입니다. 풀면 presentation-map/ 폴더가 생깁니다."
+              echo
+              echo "- 실행·이식 방법과 크기: 폴더 안의 README_KO.md"
+              echo "- 파일마다 SHA-256: SHA256SUMS.txt (ZIP 안에도 같은 파일이 있음)"
+              echo "- ZIP SHA-256: $EXPECT"
+            } > "$RUNNER_TEMP/notes.md"
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+          gh release upload "$TAG" "$RUNNER_TEMP/out/$TAG.zip" "$RUNNER_TEMP/out/SHA256SUMS.txt" --clobber
+      - name: Download the attached files again and compare SHA-256
+        if: inputs.upload == 'yes'
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/dl"
+          gh release download "$TAG" --dir "$RUNNER_TEMP/dl"
+          a=$(sha256sum "$RUNNER_TEMP/dl/$TAG.zip" | cut -d' ' -f1)
+          b=$(sha256sum "$RUNNER_TEMP/dl/SHA256SUMS.txt" | cut -d' ' -f1)
+          c=$(sha256sum SHA256SUMS.txt | cut -d' ' -f1)
+          echo "- downloaded again: ZIP $a, SHA256SUMS.txt $b (repository $c)" >> "$GITHUB_STEP_SUMMARY"
+          [ "$a" = "$EXPECT" ] && [ "$b" = "$c" ]
