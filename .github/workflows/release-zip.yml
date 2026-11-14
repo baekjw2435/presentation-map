@@ -1,8 +1,11 @@
 name: release-zip
 
 # Builds the ZIP of the bundle (the files listed in SHA256SUMS.txt) and, when started by hand with upload = yes,
-# attaches it and SHA256SUMS.txt to the GitHub release <tag>, then downloads both again and compares SHA-256.
-# The ZIP must have the SHA-256 given in expect_sha256 (the one built in the research repository), or nothing is uploaded.
+# attaches it and SHA256SUMS.txt to the GitHub release <tag>, then downloads them again and compares SHA-256.
+# With base_tag (an earlier release of this repository) it also builds <tag>-update.zip: only the files that are new
+# or changed since base_tag, SHA256SUMS.txt and UPDATE_KO.txt.
+# Each ZIP must have the SHA-256 given (the one built in the research repository with the same pack_portable.py),
+# or nothing is uploaded.
 
 on:
   workflow_dispatch:
@@ -12,7 +15,13 @@ on:
         default: "presentation-map-2026-11-14"
       expect_sha256:
         description: "SHA-256 the ZIP must have"
-        default: "6a55e802ec570c8fa8454a39e1f853c820afd11722f5841a229cb076ee964710"
+        required: true
+      base_tag:
+        description: "Earlier release to build the update ZIP against (empty = no update ZIP)"
+        default: ""
+      expect_update_sha256:
+        description: "SHA-256 the update ZIP must have (with base_tag)"
+        default: ""
       upload:
         description: "yes = create the release and attach the files; anything else = only build and check"
         default: "no"
@@ -35,26 +44,40 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ inputs.tag }}
       EXPECT: ${{ inputs.expect_sha256 }}
+      BASE: ${{ inputs.base_tag }}
+      EXPECT_UPD: ${{ inputs.expect_update_sha256 }}
       UPLOAD: ${{ inputs.upload }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      - name: Check the files and build the ZIP
+      - name: Check the files and build the ZIPs
         run: |
           set -euo pipefail
           case "$TAG" in presentation-map-*) ;; *) echo "unexpected tag: $TAG"; exit 1 ;; esac
-          mkdir -p "$RUNNER_TEMP/out"
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
           python3 -c "import zlib, sys; print('python', sys.version.split()[0], 'zlib', zlib.ZLIB_RUNTIME_VERSION)"
-          python3 .github/zip_bundle.py . "$RUNNER_TEMP/out/$TAG.zip" | tee "$RUNNER_TEMP/zip.json"
-          cp SHA256SUMS.txt "$RUNNER_TEMP/out/SHA256SUMS.txt"
-          got=$(sha256sum "$RUNNER_TEMP/out/$TAG.zip" | cut -d' ' -f1)
-          echo "- ZIP $TAG.zip: $(stat -c %s "$RUNNER_TEMP/out/$TAG.zip") bytes, SHA-256 $got (expected $EXPECT)" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$BASE" ]; then
+            mkdir -p "$RUNNER_TEMP/base"
+            gh release download "$BASE" --pattern SHA256SUMS.txt --dir "$RUNNER_TEMP/base"
+            python3 .github/pack_portable.py zip . "$out/$TAG.zip" --base-sums "$RUNNER_TEMP/base/SHA256SUMS.txt" --update-zip "$out/$TAG-update.zip"
+          else
+            python3 .github/pack_portable.py zip . "$out/$TAG.zip"
+          fi
+          cp SHA256SUMS.txt "$out/SHA256SUMS.txt"
+          got=$(sha256sum "$out/$TAG.zip" | cut -d' ' -f1)
+          echo "- ZIP $TAG.zip: $(stat -c %s "$out/$TAG.zip") bytes, SHA-256 $got (expected $EXPECT)" >> "$GITHUB_STEP_SUMMARY"
           [ "$got" = "$EXPECT" ] || { echo "ZIP SHA-256 differs from expect_sha256"; exit 1; }
+          if [ -n "$BASE" ]; then
+            upd=$(sha256sum "$out/$TAG-update.zip" | cut -d' ' -f1)
+            echo "- update ZIP $TAG-update.zip (from $BASE): $(stat -c %s "$out/$TAG-update.zip") bytes, SHA-256 $upd (expected $EXPECT_UPD)" >> "$GITHUB_STEP_SUMMARY"
+            [ "$upd" = "$EXPECT_UPD" ] || { echo "update ZIP SHA-256 differs from expect_update_sha256"; exit 1; }
+          fi
       - name: Create the release and attach the files
         if: inputs.upload == 'yes'
         run: |
           set -euo pipefail
+          out="$RUNNER_TEMP/out"
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             {
               echo "제시 단어 수순 지도의 이식용 묶음입니다. 풀면 presentation-map/ 폴더가 생깁니다."
@@ -62,10 +85,13 @@ jobs:
               echo "- 실행·이식 방법과 크기: 폴더 안의 README_KO.md"
               echo "- 파일마다 SHA-256: SHA256SUMS.txt (ZIP 안에도 같은 파일이 있음)"
               echo "- ZIP SHA-256: $EXPECT"
+              if [ -n "$BASE" ]; then
+                echo "- 갱신본 $TAG-update.zip: $BASE 에서 바뀐 파일만. 이전 폴더 위에 풀어 덮어씁니다(안의 UPDATE_KO.txt 참고). SHA-256: $EXPECT_UPD"
+              fi
             } > "$RUNNER_TEMP/notes.md"
             gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
           fi
-          gh release upload "$TAG" "$RUNNER_TEMP/out/$TAG.zip" "$RUNNER_TEMP/out/SHA256SUMS.txt" --clobber
+          gh release upload "$TAG" "$out"/* --clobber
       - name: Download the attached files again and compare SHA-256
         if: inputs.upload == 'yes'
         run: |
@@ -77,3 +103,8 @@ jobs:
           c=$(sha256sum SHA256SUMS.txt | cut -d' ' -f1)
           echo "- downloaded again: ZIP $a, SHA256SUMS.txt $b (repository $c)" >> "$GITHUB_STEP_SUMMARY"
           [ "$a" = "$EXPECT" ] && [ "$b" = "$c" ]
+          if [ -n "$BASE" ]; then
+            u=$(sha256sum "$RUNNER_TEMP/dl/$TAG-update.zip" | cut -d' ' -f1)
+            echo "- downloaded again: update ZIP $u" >> "$GITHUB_STEP_SUMMARY"
+            [ "$u" = "$EXPECT_UPD" ]
+          fi
